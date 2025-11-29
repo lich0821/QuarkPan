@@ -527,8 +527,8 @@ x-oss-user-agent:aliyun-sdk-js/1.0.0 Chrome Mobile 139.0.0.0 on Google Nexus 5 (
         auth_key = auth_data.get('auth_key', '')
 
         # 构造上传URL（使用阿里云OSS域名格式）
-        # 格式：https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?partNumber={part_number}&uploadId={upload_id}
-        upload_url = f"https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?partNumber={part_number}&uploadId={upload_id}"
+        # 格式：https://{bucket}.pds.quark.cn/{obj_key}?partNumber={part_number}&uploadId={upload_id}
+        upload_url = f"https://{bucket}.pds.quark.cn/{obj_key}?partNumber={part_number}&uploadId={upload_id}"
 
         headers = {
             'Content-Type': mime_type,
@@ -631,7 +631,7 @@ x-oss-user-agent:aliyun-sdk-js/1.0.0 Chrome 139.0.0.0 on OS X 10.15.7 64-bit
         auth_key = auth_data.get('auth_key', '')
 
         # 构造上传URL（不带partNumber，使用阿里云OSS域名格式）
-        upload_url = f"https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?uploadId={upload_id}"
+        upload_url = f"https://{bucket}.pds.quark.cn/{obj_key}?uploadId={upload_id}"
 
         # 构造headers
         headers = {
