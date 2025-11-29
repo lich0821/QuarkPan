@@ -97,7 +97,7 @@ class ShareService:
         data = {
             'fid_list': file_ids,
             'title': title,
-            'url_type': 1,  # 公开链接
+            'url_type': 2 if password else 1,  # 1=公开链接, 2=私密链接
             'expired_type': 1 if expire_days == 0 else 2  # 1=永久，2=有期限
         }
 
