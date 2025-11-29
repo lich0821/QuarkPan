@@ -7,7 +7,7 @@ name = "quarkpan"
 version = "1.0.5"
 description = "夸克网盘 Python 客户端和命令行工具"
 readme = "README.md"
-license = "MIT"
+license = {file = "LICENSE"}
 authors = [{ name = "QuarkPan Team", email = "tequant.ai@gmail.com" }]
 maintainers = [{ name = "QuarkPan Team", email = "tequant.ai@gmail.com" }]
 keywords = ["quark", "pan", "cloud", "storage", "cli", "api", "client", "网盘"]
