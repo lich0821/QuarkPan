@@ -93,7 +93,22 @@ class FileUploadService:
         if progress_callback:
             progress_callback(20, "更新文件哈希...")
 
-        self._update_file_hash(task_id, md5_hash, sha1_hash)
+        hash_result = self._update_file_hash(task_id, md5_hash, sha1_hash)
+
+        # 检查是否秒传成功（文件已存在于服务器）
+        if hash_result.get('finish'):
+            if progress_callback:
+                progress_callback(100, "秒传成功")
+            return {
+                'status': 'success',
+                'task_id': task_id,
+                'file_name': file_name,
+                'file_size': file_size,
+                'md5': md5_hash,
+                'sha1': sha1_hash,
+                'upload_result': {'strategy': 'instant_upload', 'message': '秒传成功，文件已存在'},
+                'finish_result': hash_result
+            }
 
         # 步骤3: 根据文件大小选择上传策略
         if file_size < 5 * 1024 * 1024:  # < 5MB 单分片上传
