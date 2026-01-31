@@ -14,8 +14,8 @@ def get_config_dir() -> Path:
     if config_dir:
         return Path(config_dir)
 
-    # 默认使用当前目录下的config文件夹
-    return Path.cwd() / 'config'
+    # 默认使用用户主目录下的 .quarkpan 文件夹（不受 cd 影响）
+    return Path.home() / '.quarkpan'
 
 
 def get_default_headers() -> Dict[str, str]:
