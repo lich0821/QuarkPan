@@ -385,9 +385,9 @@ def upload_file(file_path: str, parent_folder_id: str = "0", folder_path: Option
                 def progress_callback(percent: int, message: str):
                     progress.update(task, completed=percent, description=message)
 
-                # 开始上传
+                # 开始上传（使用绝对路径）
                 result = client.upload_file(
-                    file_path=str(file_path),
+                    file_path=str(file_path_obj.resolve()),
                     parent_folder_id=parent_folder_id,
                     progress_callback=progress_callback
                 )
