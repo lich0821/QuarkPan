@@ -266,7 +266,7 @@ class QuarkClient:
             存储信息
         """
         try:
-            response = self.api_client.get('capacity')
+            response = self.api_client.get('member')      #26-4-4 由capacity变更为member
             return response
         except Exception as e:
             return {'error': str(e)}
