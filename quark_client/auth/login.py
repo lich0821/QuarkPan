@@ -25,6 +25,7 @@ class QuarkAuth:
         self.timeout = timeout
         self.config_dir = get_config_dir()
         self.cookies_file = self.config_dir / "cookies.json"
+        self.cookies_plain_file = self.config_dir / "cookies.txt"
         self.logger = get_logger(__name__)
 
         # 确保配置目录存在
@@ -39,8 +40,19 @@ class QuarkAuth:
                     'timestamp': int(time.time()),
                     'expires_at': self._get_cookies_expire_time(cookies)
                 }, f, ensure_ascii=False, indent=2)
+            # 同时以纯文本方式导出，方便交给其它工具复用
+            self._save_cookies_plain_text(cookies)
         except Exception as e:
             raise ConfigError(f"保存cookies失败: {e}")
+
+    def _save_cookies_plain_text(self, cookies: List[Dict]) -> None:
+        """将cookies以纯文本形式导出到本地文件"""
+        try:
+            cookie_string = self._cookies_to_string(cookies)
+            with open(self.cookies_plain_file, 'w', encoding='utf-8') as f:
+                f.write(cookie_string)
+        except Exception as e:
+            self.logger.warning(f"保存纯文本cookies失败: {e}")
 
     def _load_cookies(self) -> Optional[Dict]:
         """从本地文件加载cookies"""
@@ -261,8 +273,9 @@ class QuarkAuth:
     def logout(self) -> None:
         """登出并清除本地cookies"""
         try:
-            if self.cookies_file.exists():
-                self.cookies_file.unlink()
+            for file in [self.cookies_file, self.cookies_plain_file]:
+                if file.exists():
+                    file.unlink()
             self.logger.debug("已清除登录信息")
         except Exception as e:
             self.logger.error(f"清除登录信息时出错: {e}")
