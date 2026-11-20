@@ -21,6 +21,11 @@ _DESKTOP_UA = (
 
 # 夸克网盘客户端 UA。普通 UA 请求 file/download 时，大文件会返回
 # code=23018 (download file size limit)，换用此 UA 重试即可绕过该限制。
+#
+# 此 UA 与「换 UA 重试」的做法参考自 ihmily/QuarkPanTool（Apache-2.0）：
+#   https://github.com/ihmily/QuarkPanTool
+# 本项目以同步 httpx 重写，改动了其异步实现；署名与许可说明见
+# 根目录 THIRD_PARTY_NOTICES.md 与 docs/licenses/Apache-2.0.txt。
 _QUARK_CLIENT_UA = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
     '(KHTML, like Gecko) quark-cloud-drive/2.5.56 Chrome/100.0.4896.160 '

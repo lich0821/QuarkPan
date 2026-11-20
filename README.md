@@ -753,5 +753,8 @@ pip install -r requirements.txt pytest pytest-asyncio
 
 本项目采用 [MIT License](LICENSE) 开源协议。
 
+部分下载相关实现参考了第三方项目，其署名与许可（Apache License 2.0）见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ---
 ⭐ 如果这个项目对你有帮助，请给个 Star 支持一下！
