@@ -373,10 +373,36 @@ class InteractiveShell:
             print_error("请提供要下载的文件路径")
             return
 
-        path = args[0]
+        # 支持 download <path> [--aria2] [-x N]
+        use_aria2 = False
+        connections = 16
+        paths: List[str] = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg in ('--aria2', '-a'):
+                use_aria2 = True
+            elif arg in ('-x', '--connections') and i + 1 < len(args):
+                try:
+                    connections = int(args[i + 1])
+                except ValueError:
+                    print_error(f"无效的连接数: {args[i + 1]}")
+                    return
+                i += 1
+            else:
+                paths.append(arg)
+            i += 1
+
+        if not paths:
+            print_error("请提供要下载的文件路径")
+            return
+
+        path = paths[0]
 
         try:
             print_info(f"准备下载: {path}")
+            if use_aria2:
+                print_info(f"⚡ 使用 aria2c 下载（{connections} 连接）")
 
             def progress_callback(downloaded, total):
                 if total > 0:
@@ -386,7 +412,9 @@ class InteractiveShell:
             downloaded_path = self.client.download_file_by_name(  # type: ignore[attr-defined]
                 path,
                 current_folder_id=self.current_folder_id,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                downloader='aria2' if use_aria2 else 'native',
+                aria2_options={'connections': connections, 'split': connections}
             )
 
             print()  # 换行
