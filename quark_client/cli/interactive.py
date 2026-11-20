@@ -2,15 +2,22 @@
 交互式CLI模式
 """
 
+import html
 import os
 import shlex
-from typing import List, Optional
+from typing import Dict, List, Optional
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.shortcuts import CompleteStyle
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.table import Table
 
+from ..config import get_config_dir
 from .commands.basic_fileops import upload_file
 from .commands.batch_share_commands import batch_share, list_structure
 from .commands.move_commands import move_files
@@ -18,6 +25,130 @@ from .commands.share_commands import create_share, list_my_shares, save_share
 from .utils import get_client, print_error, print_info, print_success, print_warning
 
 console = Console()
+
+# 命令名 -> 补全菜单右侧的描述（与 InteractiveShell.commands 保持一致）
+COMMAND_DESCRIPTIONS: Dict[str, str] = {
+    'help': '显示帮助',
+    'h': '显示帮助',
+    '?': '显示帮助',
+    'exit': '退出',
+    'quit': '退出',
+    'q': '退出',
+    'ls': '列出当前目录',
+    'list': '列出当前目录',
+    'll': '详细列表',
+    'cd': '切换目录',
+    'pwd': '显示当前路径',
+    'search': '搜索文件',
+    'find': '搜索文件',
+    'download': '下载文件',
+    'dl': '下载文件',
+    'mkdir': '创建文件夹',
+    'rm': '删除',
+    'del': '删除',
+    'delete': '删除',
+    'rename': '重命名',
+    'mv': '重命名/移动',
+    'info': '查看文件信息',
+    'upload': '上传文件',
+    'up': '上传文件',
+    'share': '创建分享',
+    'shares': '我的分享',
+    'save': '转存分享',
+    'move': '移动文件',
+    'batch-share': '批量分享',
+    'list-dirs': '目录结构',
+    'status': '登录状态',
+    'version': '版本',
+    'clear': '清屏',
+    'cls': '清屏',
+}
+
+# 这些命令不接受路径参数，不需要补全文件名
+_NO_PATH_ARG_COMMANDS = {
+    'help', 'h', '?', 'exit', 'quit', 'q', 'ls', 'list', 'll', 'pwd',
+    'clear', 'cls', 'status', 'version', 'shares', 'list-dirs', 'batch-share',
+    'upload', 'up', 'save', 'search', 'find', 'mkdir',
+}
+
+# 这些命令的路径参数只可能是文件夹
+_FOLDER_ONLY_COMMANDS = {'cd', 'ls', 'list'}
+
+
+class ShellCompleter(Completer):
+    """交互式 Shell 的 Tab 补全器
+
+    - 行首补全命令名，候选右侧显示描述
+    - 命令之后补全当前目录的文件/文件夹名
+    - 插入的文本统一用 shlex.quote 转义，避免带空格的文件名被 shlex.split 拆碎
+    """
+
+    def __init__(self, shell: 'InteractiveShell'):
+        self.shell = shell
+
+    def get_completions(self, document: Document, complete_event):
+        before = document.text_before_cursor
+        word = document.get_word_before_cursor()  # 按空白切分的当前词（保留引号原样）
+        stripped = before.strip()
+
+        # 还在输入命令名
+        if not stripped or stripped == word:
+            for name in sorted(COMMAND_DESCRIPTIONS):
+                if name.lower().startswith(word.lower()):
+                    yield Completion(
+                        name,
+                        start_position=-len(word),
+                        display_meta=COMMAND_DESCRIPTIONS[name],
+                    )
+            return
+
+        # 补全参数
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            tokens = stripped.split()
+        if not tokens:
+            return
+
+        cmd = tokens[0].lower()
+        if cmd in _NO_PATH_ARG_COMMANDS:
+            return
+
+        # 当前正在输入第几个参数（1 表示第一个参数）
+        arg_index = len(tokens) if before.endswith(' ') else len(tokens) - 1
+
+        # rename 的第二个参数是新名字，没有可补全的内容
+        if cmd == 'rename' and arg_index > 1:
+            return
+
+        folder_only = cmd in _FOLDER_ONLY_COMMANDS or (cmd == 'move' and arg_index >= 2)
+        prefix = self._unquote(word)
+
+        if cmd == 'cd' and '..'.startswith(prefix):
+            yield Completion('..', start_position=-len(word), display_meta='上级目录')
+
+        for entry in list(getattr(self.shell, '_dir_entries', [])):
+            name = entry.get('file_name') or ''
+            if not name:
+                continue
+            is_dir = entry.get('file_type') == 0
+            if folder_only and not is_dir:
+                continue
+            if not name.lower().startswith(prefix.lower()):
+                continue
+            yield Completion(
+                shlex.quote(name),
+                start_position=-len(word),
+                display=name,
+                display_meta='文件夹' if is_dir else '文件',
+            )
+
+    @staticmethod
+    def _unquote(text: str) -> str:
+        """去掉用户已输入的引号，便于做前缀匹配"""
+        if text[:1] in ("'", '"'):
+            return text[1:]
+        return text
 
 
 class InteractiveShell:
@@ -31,6 +162,9 @@ class InteractiveShell:
 
         # 目录栈：存储 (folder_id, folder_name) 的路径
         self.directory_stack = [("0", "根目录")]
+
+        # 当前目录的条目缓存，仅供 Tab 补全使用（ls/ll 填充，cd 后清空）
+        self._dir_entries: List[dict] = []
 
         # 命令映射
         self.commands = {
@@ -95,13 +229,31 @@ class InteractiveShell:
             print_error(f"初始化失败: {e}")
             return
 
+        # 创建交互会话（必须在循环外创建，保留补全状态与历史）
+        history_dir = get_config_dir()
+        try:
+            history_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        session: PromptSession = PromptSession(
+            completer=ShellCompleter(self),
+            complete_style=CompleteStyle.MULTI_COLUMN,
+            reserve_space_for_menu=10,
+            history=FileHistory(str(history_dir / 'shell_history')),
+            complete_while_typing=False,
+            enable_history_search=False,
+        )
+
         # 主循环
         while self.running:
             try:
                 # 显示提示符 - 使用友好显示名称
                 display_name = self._get_display_name(self.current_folder_name)
-                prompt = f"[cyan]quark[/cyan]:[blue]{display_name}[/blue]$ "
-                command_line = Prompt.ask(prompt).strip()
+                prompt = HTML(
+                    f"<ansicyan>quark</ansicyan>:"
+                    f"<ansiblue>{html.escape(display_name)}</ansiblue>$ "
+                )
+                command_line = session.prompt(prompt).strip()
 
                 if not command_line:
                     continue
@@ -189,6 +341,14 @@ class InteractiveShell:
         console.print("• 使用绝对路径: [cyan]/文件夹/文件.txt[/cyan]")
         console.print("• 文件夹路径末尾加/: [cyan]文件夹/[/cyan]")
 
+        console.print("\n[bold yellow]快捷键:[/bold yellow]")
+        console.print("• [cyan]Tab[/cyan]          补全命令 / 文件名（多列候选，方向键选择）")
+        console.print("• [cyan]↑ / ↓[/cyan]        翻阅历史命令")
+        console.print("• [cyan]← / →[/cyan]        移动光标")
+        console.print("• [cyan]Ctrl-R[/cyan]       搜索历史")
+        console.print("• [cyan]Ctrl-C[/cyan]       中断当前输入（不退出）")
+        console.print("• [cyan]Ctrl-D[/cyan]       退出")
+
     def cmd_exit(self, args: List[str]):
         """退出程序"""
         self.running = False
@@ -227,6 +387,10 @@ class InteractiveShell:
             files = self.client.list_files(target_folder_id, size=50)  # type: ignore[attr-defined]
             file_list = files.get('data', {}).get('list', [])
 
+            # 仅当列出的是当前目录时，才更新补全缓存
+            if target_folder_id == self.current_folder_id:
+                self._dir_entries = list(file_list)
+
             if not file_list:
                 print_info("目录为空")
                 return
@@ -255,6 +419,9 @@ class InteractiveShell:
         try:
             files = self.client.list_files(self.current_folder_id, size=50)  # type: ignore[attr-defined]
             file_list = files.get('data', {}).get('list', [])
+
+            # 更新补全缓存
+            self._dir_entries = list(file_list)
 
             if not file_list:
                 print_info("目录为空")
@@ -571,6 +738,9 @@ class InteractiveShell:
         # 更新当前目录
         self.current_folder_id = folder_id
         self.current_folder_name = folder_name
+
+        # 清空补全缓存，避免 Tab 补全出上一个目录的文件名
+        self._dir_entries = []
 
         # 显示切换成功信息
         display_name = self._get_display_name(folder_name)
