@@ -353,3 +353,31 @@ quark_client/cli/interactive.py | 180 +++++++++++++++++++--
 
 - 菜单首行 `..` 与文件夹并列时公共前缀为空，首次 Tab 只弹菜单不插入文本（与 zsh 行为一致），再按一次 Tab 才选中。
 - `upload` 的超参是本机路径，未接 `PathCompleter`（本次范围外）。
+
+---
+
+## 10. 补充：首次 Tab 的目录预加载（2026-11-20）
+
+问题：首次进入时未执行过 `ls`，`_dir_entries` 为空，`cd <Tab>` 只能补出 `..`。
+
+改动：
+
+| 新增 | 说明 |
+|---|---|
+| `prefetch_entries(wait=0.0)` | 后台线程拉取当前目录列表；`wait` 用于首次按 Tab 时短暂等待 |
+| `_prefetch_worker(folder_id)` | 线程体，成功/失败都记录 `_entries_for = folder_id`，避免空目录或失败后反复重试 |
+| `entries_ready()` / `get_dir_entries()` | 判断缓存是否属于当前目录，别的目录的缓存不会被拿来补全 |
+| `_reset_entries()` | `cd`、`cd ..`、`cd` 回根目录后作废缓存并立即重新预加载 |
+| `_bottom_toolbar()` | 底部状态栏：未加载时显示「⏳ 正在加载目录…」，否则显示路径 + 条目数 + 快捷键提示 |
+| `_invalidate_prompt()` | 后台线程加载完成后调用 `get_app_or_none().invalidate()` 刷新状态栏（线程安全） |
+
+时序：
+
+1. 登录成功 → `prefetch_entries()` 立刻在后台开始拉当前目录
+2. 提示「正在后台加载当前目录，完成后 Tab 可补全文件名…」（仅未就绪时）
+3. 用户按 Tab 时若仍未就绪 → `prefetch_entries(wait=2.0)` 最多等 2 秒
+4. 加载期间切换目录 → worker 结束检查 `current_folder_id`，自动为新目录重新加载
+
+验证：`prefetch_entries()` 后 0.6 秒，`entries_ready()` 为真，`cd <Tab>` 出现 `来自：分享`，`download 落<Tab>` 得到 `'落幕曲 1.5.4.zip'`；切目录后 `entries_ready()` 立即变假并重新加载。
+
+注：底部状态栏在 pty 测试环境下无法验证（终端不响应 CPR，prompt_toolkit 退化为不渲染辅助行），需在真实终端确认。
