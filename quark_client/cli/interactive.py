@@ -2,15 +2,24 @@
 交互式CLI模式
 """
 
+import html
 import os
 import shlex
-from typing import List, Optional
+import threading
+from typing import Dict, List, Optional
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import get_app_or_none
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.shortcuts import CompleteStyle
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.table import Table
 
+from ..config import get_config_dir
 from .commands.basic_fileops import upload_file
 from .commands.batch_share_commands import batch_share, list_structure
 from .commands.move_commands import move_files
@@ -18,6 +27,153 @@ from .commands.share_commands import create_share, list_my_shares, save_share
 from .utils import get_client, print_error, print_info, print_success, print_warning
 
 console = Console()
+
+# 命令名 -> 补全菜单右侧的描述（与 InteractiveShell.commands 保持一致）
+COMMAND_DESCRIPTIONS: Dict[str, str] = {
+    'help': '显示帮助',
+    'h': '显示帮助',
+    '?': '显示帮助',
+    'exit': '退出',
+    'quit': '退出',
+    'q': '退出',
+    'ls': '列出当前目录',
+    'list': '列出当前目录',
+    'll': '详细列表',
+    'cd': '切换目录',
+    'pwd': '显示当前路径',
+    'search': '搜索文件',
+    'find': '搜索文件',
+    'download': '下载文件',
+    'dl': '下载文件',
+    'mkdir': '创建文件夹',
+    'rm': '删除',
+    'del': '删除',
+    'delete': '删除',
+    'rename': '重命名',
+    'mv': '重命名/移动',
+    'info': '查看文件信息',
+    'upload': '上传文件',
+    'up': '上传文件',
+    'share': '创建分享',
+    'shares': '我的分享',
+    'save': '转存分享',
+    'move': '移动文件',
+    'batch-share': '批量分享',
+    'list-dirs': '目录结构',
+    'status': '登录状态',
+    'version': '版本',
+    'clear': '清屏',
+    'cls': '清屏',
+}
+
+# 这些命令不接受路径参数，不需要补全文件名
+_NO_PATH_ARG_COMMANDS = {
+    'help', 'h', '?', 'exit', 'quit', 'q', 'ls', 'list', 'll', 'pwd',
+    'clear', 'cls', 'status', 'version', 'shares', 'list-dirs', 'batch-share',
+    'upload', 'up', 'save', 'search', 'find', 'mkdir',
+}
+
+# 这些命令的路径参数只可能是文件夹
+_FOLDER_ONLY_COMMANDS = {'cd', 'ls', 'list'}
+
+
+class ShellCompleter(Completer):
+    """交互式 Shell 的 Tab 补全器
+
+    - 行首补全命令名，候选右侧显示描述
+    - 命令之后补全当前目录的文件/文件夹名
+    - 插入的文本统一用 shlex.quote 转义，避免带空格的文件名被 shlex.split 拆碎
+    """
+
+    def __init__(self, shell: 'InteractiveShell'):
+        self.shell = shell
+
+    def get_completions(self, document: Document, complete_event):
+        before = document.text_before_cursor
+        word = document.get_word_before_cursor(WORD=True)  # 只按空白切分，保留 / 与 .. 前缀
+        stripped = before.strip()
+
+        # 还在输入命令名
+        if not stripped or stripped == word:
+            for name in sorted(COMMAND_DESCRIPTIONS):
+                if name.lower().startswith(word.lower()):
+                    yield Completion(
+                        name,
+                        start_position=-len(word),
+                        display_meta=COMMAND_DESCRIPTIONS[name],
+                    )
+            return
+
+        # 补全参数
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            tokens = stripped.split()
+        if not tokens:
+            return
+
+        cmd = tokens[0].lower()
+        if cmd in _NO_PATH_ARG_COMMANDS:
+            return
+
+        # 当前正在输入第几个参数（1 表示第一个参数）
+        arg_index = len(tokens) if before.endswith(' ') else len(tokens) - 1
+
+        # rename 的第二个参数是新名字，没有可补全的内容
+        if cmd == 'rename' and arg_index > 1:
+            return
+
+        folder_only = cmd in _FOLDER_ONLY_COMMANDS or (cmd == 'move' and arg_index >= 2)
+        prefix = self._unquote(word)
+
+        # 把前缀拆成「目录部分 + 名字部分」，支持 ../ 、/ 、子目录/
+        if '/' in prefix:
+            dir_part, name_prefix = prefix.rsplit('/', 1)
+            dir_part += '/'
+        else:
+            dir_part, name_prefix = '', prefix
+
+        if dir_part:
+            base_id = self.shell.resolve_completion_dir(dir_part)
+            if base_id is None:
+                return
+        else:
+            base_id = self.shell.current_folder_id
+
+        # 未缓存时后台加载，首次 Tab 最多等 2 秒换正确结果
+        entries = self.shell.load_entries(base_id, wait=2.0)
+
+        # 根目录没有上级，不提供 ..
+        if cmd == 'cd' and base_id != '0' and '..'.startswith(name_prefix):
+            yield Completion(
+                dir_part + '..',
+                start_position=-len(word),
+                display='..',
+                display_meta='上级目录',
+            )
+
+        for entry in entries:
+            name = entry.get('file_name') or ''
+            if not name:
+                continue
+            is_dir = entry.get('file_type') == 0
+            if folder_only and not is_dir:
+                continue
+            if not name.lower().startswith(name_prefix.lower()):
+                continue
+            yield Completion(
+                dir_part + shlex.quote(name),
+                start_position=-len(word),
+                display=name,
+                display_meta='文件夹' if is_dir else '文件',
+            )
+
+    @staticmethod
+    def _unquote(text: str) -> str:
+        """去掉用户已输入的引号，便于做前缀匹配"""
+        if text[:1] in ("'", '"'):
+            return text[1:]
+        return text
 
 
 class InteractiveShell:
@@ -31,6 +187,13 @@ class InteractiveShell:
 
         # 目录栈：存储 (folder_id, folder_name) 的路径
         self.directory_stack = [("0", "根目录")]
+
+        # 补全缓存与后台加载状态（按 folder_id 缓存，支持 ../ 、/ 、子目录/ 前缀）
+        self._dir_cache: Dict[str, List[dict]] = {}
+        self._load_failed: set = set()                  # 已尝试且失败的目录 id
+        self._inflight: Dict[str, threading.Thread] = {}
+        self._cache_lock = threading.Lock()
+        self._prefetch_error: Optional[str] = None
 
         # 命令映射
         self.commands = {
@@ -71,6 +234,148 @@ class InteractiveShell:
             'version': self.cmd_version,
         }
 
+    # ------------------------------------------------------------------
+    # 补全缓存的后台加载
+    # ------------------------------------------------------------------
+    def entries_ready(self) -> bool:
+        """当前目录是否已尝试加载过（成功、空目录或失败都算）"""
+        with self._cache_lock:
+            folder_id = self.current_folder_id
+            return folder_id in self._dir_cache or folder_id in self._load_failed
+
+    def load_entries(self, folder_id: str, wait: float = 0.0) -> List[dict]:
+        """取指定目录的条目；未缓存时后台加载，wait>0 则最多等这么久"""
+        thread = None
+        with self._cache_lock:
+            if folder_id in self._dir_cache:
+                return list(self._dir_cache[folder_id])
+            if folder_id in self._load_failed:
+                return []
+            thread = self._inflight.get(folder_id)
+            if thread is None and self.client is not None:
+                thread = threading.Thread(
+                    target=self._fetch_entries, args=(folder_id,), daemon=True
+                )
+                self._inflight[folder_id] = thread
+                thread.start()
+        if thread is not None and wait:
+            thread.join(wait)
+        with self._cache_lock:
+            return list(self._dir_cache.get(folder_id, []))
+
+    def _fetch_entries(self, folder_id: str) -> None:
+        """后台线程：拉指定目录的列表并写入缓存"""
+        entries: Optional[List[dict]] = None
+        try:
+            files = self.client.list_files(folder_id, size=50)  # type: ignore[union-attr]
+            entries = list(files.get('data', {}).get('list', []) or [])
+        except Exception as e:
+            self._prefetch_error = str(e)
+        with self._cache_lock:
+            if entries is None:
+                self._load_failed.add(folder_id)
+            else:
+                self._dir_cache[folder_id] = entries
+                self._load_failed.discard(folder_id)
+            self._inflight.pop(folder_id, None)
+        self._invalidate_prompt()
+
+    def prefetch_entries(self, wait: float = 0.0) -> None:
+        """后台预加载当前目录，供 Tab 补全使用
+
+        Args:
+            wait: 最多等待多少秒（首次按 Tab 时用短暂等待换取正确结果）
+        """
+        self.load_entries(self.current_folder_id, wait=wait)
+
+    def _reset_entries(self) -> None:
+        """切换目录后确保新目录已加载（已缓存过的目录直接命中）"""
+        self.prefetch_entries()
+
+    def _remember_entries(self, folder_id: str, entries: List[dict]) -> None:
+        """用命令拿到的最新结果刷新缓存"""
+        with self._cache_lock:
+            self._dir_cache[folder_id] = list(entries)
+            self._load_failed.discard(folder_id)
+
+    def resolve_completion_dir(self, dir_part: str) -> Optional[str]:
+        """把补全前缀里的目录部分解析成 folder_id
+
+        支持 ``''``、``.``、``/``、``..``、``../..``、``子目录/``、``/子目录/``；
+        无法解析时返回 None（此时不给候选）。
+        """
+        if dir_part in ('', '.'):
+            return self.current_folder_id
+
+        absolute = dir_part.startswith('/')
+        parts = [p for p in dir_part.split('/') if p not in ('', '.')]
+
+        if absolute:
+            base_id = '0'
+        else:
+            base_id = self.current_folder_id
+            stack = list(self.directory_stack)
+            while parts and parts[0] == '..':
+                parts.pop(0)
+                if len(stack) > 1:
+                    stack.pop()
+                    base_id = stack[-1][0]
+                else:
+                    base_id = '0'
+
+        for name in parts:
+            if name == '..':
+                return None
+            entry = self._find_subfolder(base_id, name)
+            if entry is None:
+                return None
+            fid = entry.get('fid') or entry.get('file_id')
+            if not fid:
+                return None
+            base_id = str(fid)
+
+        return base_id
+
+    def _find_subfolder(self, folder_id: str, name: str) -> Optional[dict]:
+        """在指定目录里按名字找子文件夹"""
+        for entry in self.load_entries(folder_id, wait=1.0):
+            if entry.get('file_type') == 0 and entry.get('file_name') == name:
+                return entry
+        return None
+
+    @staticmethod
+    def _invalidate_prompt() -> None:
+        """线程安全地请求重绘（让底部状态栏刷新）"""
+        try:
+            app = get_app_or_none()
+            if app is not None:
+                app.invalidate()
+        except Exception:
+            pass
+
+    def _bottom_toolbar(self):
+        """底部状态栏：加载中 / 加载失败 / 当前路径与条目数"""
+        folder_id = self.current_folder_id
+        with self._cache_lock:
+            failed = folder_id in self._load_failed
+            loaded = folder_id in self._dir_cache
+            count = len(self._dir_cache.get(folder_id, []))
+
+        if failed:
+            return HTML(
+                ' <style bg="ansiblack" fg="ansired"> 目录加载失败，执行 ls 可重试 </style> '
+            )
+        if not loaded:
+            return HTML(
+                ' <style bg="ansiblack" fg="ansiyellow"> ⏳ 正在加载目录… </style> '
+            )
+        path = html.escape(self._get_current_path())
+        hint = 'Tab 补全 · Ctrl-R 搜索历史'
+        return HTML(
+            f' <style bg="ansiblack" fg="ansicyan">{path}</style>'
+            f' <style bg="ansiblack" fg="ansigray"> {count} 项 · {hint} </style> '
+        )
+
     def start(self):
         """启动交互式模式"""
         console.print(Panel.fit(
@@ -91,17 +396,41 @@ class InteractiveShell:
             print_success("已登录夸克网盘")
             print_info(f"当前位置: {self.current_folder_name}")
 
+            # 提前在后台拉一次目录，让首次按 Tab 就能补全文件名
+            self.prefetch_entries()
+            if not self.entries_ready():
+                print_info("正在后台加载当前目录，完成后 Tab 可补全文件名…")
+
         except Exception as e:
             print_error(f"初始化失败: {e}")
             return
+
+        # 创建交互会话（必须在循环外创建，保留补全状态与历史）
+        history_dir = get_config_dir()
+        try:
+            history_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        session: PromptSession = PromptSession(
+            completer=ShellCompleter(self),
+            complete_style=CompleteStyle.MULTI_COLUMN,
+            reserve_space_for_menu=10,
+            history=FileHistory(str(history_dir / 'shell_history')),
+            complete_while_typing=False,
+            enable_history_search=False,
+            bottom_toolbar=self._bottom_toolbar,
+        )
 
         # 主循环
         while self.running:
             try:
                 # 显示提示符 - 使用友好显示名称
                 display_name = self._get_display_name(self.current_folder_name)
-                prompt = f"[cyan]quark[/cyan]:[blue]{display_name}[/blue]$ "
-                command_line = Prompt.ask(prompt).strip()
+                prompt = HTML(
+                    f"<ansicyan>quark</ansicyan>:"
+                    f"<ansiblue>{html.escape(display_name)}</ansiblue>$ "
+                )
+                command_line = session.prompt(prompt).strip()
 
                 if not command_line:
                     continue
@@ -189,6 +518,14 @@ class InteractiveShell:
         console.print("• 使用绝对路径: [cyan]/文件夹/文件.txt[/cyan]")
         console.print("• 文件夹路径末尾加/: [cyan]文件夹/[/cyan]")
 
+        console.print("\n[bold yellow]快捷键:[/bold yellow]")
+        console.print("• [cyan]Tab[/cyan]          补全命令 / 文件名（多列候选，方向键选择）")
+        console.print("• [cyan]↑ / ↓[/cyan]        翻阅历史命令")
+        console.print("• [cyan]← / →[/cyan]        移动光标")
+        console.print("• [cyan]Ctrl-R[/cyan]       搜索历史")
+        console.print("• [cyan]Ctrl-C[/cyan]       中断当前输入（不退出）")
+        console.print("• [cyan]Ctrl-D[/cyan]       退出")
+
     def cmd_exit(self, args: List[str]):
         """退出程序"""
         self.running = False
@@ -227,6 +564,9 @@ class InteractiveShell:
             files = self.client.list_files(target_folder_id, size=50)  # type: ignore[attr-defined]
             file_list = files.get('data', {}).get('list', [])
 
+            # 刷新补全缓存（不论是否为当前目录，都可能被 Tab 前缀用到）
+            self._remember_entries(target_folder_id, file_list)
+
             if not file_list:
                 print_info("目录为空")
                 return
@@ -255,6 +595,9 @@ class InteractiveShell:
         try:
             files = self.client.list_files(self.current_folder_id, size=50)  # type: ignore[attr-defined]
             file_list = files.get('data', {}).get('list', [])
+
+            # 更新补全缓存
+            self._remember_entries(self.current_folder_id, file_list)
 
             if not file_list:
                 print_info("目录为空")
@@ -545,6 +888,7 @@ class InteractiveShell:
         self.current_folder_id = "0"
         self.current_folder_name = "根目录"
         self.directory_stack = [("0", "根目录")]
+        self._reset_entries()
         print_info("已切换到根目录")
 
     def _change_to_parent(self):
@@ -559,6 +903,7 @@ class InteractiveShell:
 
         self.current_folder_id = parent_id
         self.current_folder_name = parent_name
+        self._reset_entries()
 
         display_name = self._get_display_name(parent_name)
         print_success(f"已返回上级目录: {display_name}")
@@ -571,6 +916,9 @@ class InteractiveShell:
         # 更新当前目录
         self.current_folder_id = folder_id
         self.current_folder_name = folder_name
+
+        # 作废上一目录的补全缓存，并在后台重新加载
+        self._reset_entries()
 
         # 显示切换成功信息
         display_name = self._get_display_name(folder_name)
