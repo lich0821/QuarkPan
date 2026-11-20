@@ -10,6 +10,14 @@ from typing import Dict, List, Optional
 from ..config import get_config_dir
 from ..exceptions import AuthenticationError, ConfigError
 from ..utils.logger import get_logger
+from .browser_cookies import (
+    get_browser_cookies,
+    is_usable_for_download,
+    to_cookie_records,
+)
+
+# 夸克网盘 API 层面的必要 cookie
+REQUIRED_COOKIES = ('__pus', '__kps', '__uid')
 
 
 class QuarkAuth:
@@ -26,6 +34,9 @@ class QuarkAuth:
         self.config_dir = get_config_dir()
         self.cookies_file = self.config_dir / "cookies.json"
         self.logger = get_logger(__name__)
+
+        # 最近一次凭证来源: 'browser' | 'saved' | 'login'
+        self.cookie_source: Optional[str] = None
 
         # 确保配置目录存在
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -119,12 +130,20 @@ class QuarkAuth:
         Raises:
             AuthenticationError: 登录失败
         """
-        # 如果不是强制重新登录，先尝试使用已保存的cookies
+        # 如果不是强制重新登录，优先用浏览器里的登录态，其次才是已保存的
         if not force_relogin:
+            browser_cookies = self._load_browser_cookies()
+            if browser_cookies:
+                return browser_cookies
+
             saved_cookies = self._load_cookies()
             if saved_cookies:
+                self.cookie_source = 'saved'
                 self.logger.info("使用已保存的登录凭证")
                 return self._cookies_to_string(saved_cookies['cookies'])
+
+        self._warn_fallback()
+        self.cookie_source = 'login'
 
         # 根据指定方法进行登录
         if method == "auto":
@@ -228,9 +247,58 @@ class QuarkAuth:
         quark_cookies = [c for c in cookies if 'quark' in c.get('domain', '')]
         return len(quark_cookies) > 0
 
+    def _load_browser_cookies(self) -> Optional[str]:
+        """
+        从本机浏览器（当前仅 Firefox）读取已登录的夸克 cookie
+
+        夸克 CDN 直链需要浏览器专属的 __puus，API 登录拿不到，所以浏览器
+        cookie 是默认来源。
+
+        Returns:
+            Cookie 字符串；浏览器未登录或读不到时返回 None
+        """
+        try:
+            cookies = get_browser_cookies()
+        except Exception as e:
+            self.logger.debug(f"读取浏览器 Cookie 失败: {e}")
+            return None
+
+        if not cookies:
+            return None
+
+        # 必须能在 API 层面用，才认为这份 cookie 有效
+        if not all(cookies.get(name) for name in REQUIRED_COOKIES):
+            self.logger.debug("浏览器 Cookie 缺少 API 必要字段，忽略")
+            return None
+
+        if not is_usable_for_download(cookies):
+            self.logger.warning(
+                "浏览器 Cookie 缺少浏览器会话字段（__puus），"
+                "下载大文件可能失败"
+            )
+
+        # 写入本地，供 is_logged_in / 离线场景使用
+        try:
+            self._save_cookies(to_cookie_records(cookies))
+        except Exception as e:
+            self.logger.debug(f"保存浏览器 Cookie 失败: {e}")
+
+        self.cookie_source = 'browser'
+        self.logger.debug("使用浏览器中的夸克 Cookie")
+        return '; '.join(f"{name}={value}" for name, value in cookies.items())
+
+    def _warn_fallback(self) -> None:
+        """浏览器 cookie 不可用时提示回退后果"""
+        self.logger.warning(
+            "未从浏览器读取到夸克 Cookie（Firefox 未登录或未安装），"
+            "将改用二维码登录；缺少浏览器会话 Cookie，大文件下载可能失败"
+        )
+
     def get_cookies(self, force_relogin: bool = False) -> str:
         """
         获取有效的cookies字符串
+
+        优先级：浏览器 Cookie（默认） → 本地已保存 → 二维码登录
 
         Args:
             force_relogin: 是否强制重新登录
@@ -238,24 +306,30 @@ class QuarkAuth:
         Returns:
             Cookie字符串
         """
-        # 如果不强制重新登录，先尝试返回已保存的cookies
         if not force_relogin:
+            # 默认从浏览器取，能同时满足 API 与 CDN 下载
+            browser_cookies = self._load_browser_cookies()
+            if browser_cookies:
+                return browser_cookies
+
             saved_cookies = self._load_cookies()
             if saved_cookies:
                 cookies = saved_cookies['cookies']
                 cookie_string = self._cookies_to_string(cookies)
 
                 # 简单验证：检查是否有必要的cookie
-                required_cookies = ['__pus', '__kps', '__uid']  # 夸克网盘的关键cookie
-                has_required = all(required in cookie_string for required in required_cookies)
+                has_required = all(required in cookie_string for required in REQUIRED_COOKIES)
 
                 if has_required:
+                    self.cookie_source = 'saved'
                     self.logger.debug("使用已保存的有效Cookie")
                     return cookie_string
                 else:
                     self.logger.warning("已保存的Cookie缺少必要字段，需要重新登录")
 
         # 如果没有有效的cookies或强制重新登录，则执行登录
+        self._warn_fallback()
+        self.cookie_source = 'login'
         return self.login(force_relogin)
 
     def logout(self) -> None:
@@ -269,6 +343,15 @@ class QuarkAuth:
 
     def is_logged_in(self) -> bool:
         """检查是否已登录"""
+        # 浏览器中的登录态优先（同时决定下载是否可用）
+        try:
+            browser_cookies = get_browser_cookies()
+            if browser_cookies and all(browser_cookies.get(name) for name in REQUIRED_COOKIES):
+                self.cookie_source = 'browser'
+                return True
+        except Exception:
+            pass
+
         saved_cookies = self._load_cookies()
         if saved_cookies is None:
             return False
@@ -281,12 +364,11 @@ class QuarkAuth:
 
             # 简单验证：检查是否有必要的cookie字段
             cookie_string = self._cookies_to_string(cookies)
-            required_cookies = ['__pus', '__kps', '__uid']  # 夸克网盘的关键cookie
-
-            for required in required_cookies:
+            for required in REQUIRED_COOKIES:
                 if required not in cookie_string:
                     return False
 
+            self.cookie_source = 'saved'
             return True
 
         except Exception:

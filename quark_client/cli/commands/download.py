@@ -27,7 +27,9 @@ download_app = typer.Typer(help="📥 文件下载")
 def download_file(
     file_path: str = typer.Argument(..., help="文件路径或文件ID"),
     output_dir: str = typer.Option(".", "--output", "-o", help="下载目录"),
-    filename: Optional[str] = typer.Option(None, "--name", "-n", help="自定义文件名")
+    filename: Optional[str] = typer.Option(None, "--name", "-n", help="自定义文件名"),
+    aria2: bool = typer.Option(False, "--aria2", help="使用 aria2c 多连接下载（需已安装 aria2）"),
+    connections: int = typer.Option(16, "--connections", "-x", help="aria2 单服务器最大连接数"),
 ):
     """下载单个文件（支持路径）"""
     try:
@@ -37,6 +39,13 @@ def download_file(
                 raise typer.Exit(1)
 
             print_info(f"📥 正在下载: {file_path}")
+
+            download_kwargs = {
+                'downloader': 'aria2' if aria2 else 'native',
+                'aria2_options': {'connections': connections, 'split': connections},
+            }
+            if aria2:
+                print_info(f"⚡ 使用 aria2c 下载（{connections} 连接）")
 
             # 进度回调函数
             def progress_callback(event_type, data):
@@ -57,14 +66,16 @@ def download_file(
                 downloaded_path = client.download_file(
                     file_path,
                     output_dir,
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback,
+                    **download_kwargs
                 )
             else:
                 # 路径格式，使用基于名称的下载
                 downloaded_path = client.download_file_by_name(
                     file_path,
                     output_dir,
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback,
+                    **download_kwargs
                 )
 
             print()  # 换行
@@ -84,7 +95,9 @@ def download_file(
 @download_app.command("files")
 def download_files(
     file_ids: List[str] = typer.Argument(..., help="文件ID列表"),
-    output_dir: str = typer.Option("downloads", "--output", "-o", help="下载目录")
+    output_dir: str = typer.Option("downloads", "--output", "-o", help="下载目录"),
+    aria2: bool = typer.Option(False, "--aria2", help="使用 aria2c 多连接下载（需已安装 aria2）"),
+    connections: int = typer.Option(16, "--connections", "-x", help="aria2 单服务器最大连接数"),
 ):
     """批量下载文件"""
     try:
@@ -115,7 +128,9 @@ def download_files(
             downloaded_files = client.download_files(
                 file_ids,
                 output_dir,
-                progress_callback=batch_progress_callback
+                progress_callback=batch_progress_callback,
+                downloader='aria2' if aria2 else 'native',
+                aria2_options={'connections': connections, 'split': connections}
             )
 
             print()  # 换行
@@ -195,13 +210,9 @@ def download_folder(
                 print_info("您可以使用 'quarkpan list' 命令获取文件夹ID")
                 raise typer.Exit(1)
 
-            # 使用文件夹ID下载（这里需要实现递归下载逻辑）
+            # 使用文件夹ID下载（递归下载逻辑待实现）
             print_warning("文件夹下载功能正在完善中...")
             raise typer.Exit(1)
-
-            print_success(f"📁 文件夹下载完成！")
-            print_info(f"📊 统计: 成功 {downloaded_files} 个, 失败 {failed_files} 个")
-            print_info(f"📂 下载位置: {downloaded_path}")
 
     except Exception as e:
         handle_api_error(e, "下载文件夹")
@@ -218,7 +229,6 @@ def show_download_info():
   quarkpan download file <path>        - 下载单个文件（支持路径）
   quarkpan download files <file_id>... - 批量下载文件（文件ID）
   quarkpan download folder <path>      - 下载文件夹（支持路径）
-
 [bold]路径格式:[/bold]
   • 绝对路径: /L2-2/L23-1/文件.pdf
   • 文件夹路径: /L2-2/L23-1/
@@ -234,11 +244,8 @@ def show_download_info():
   # 下载到指定目录
   quarkpan download file "/path/to/file.pdf" -o ./downloads
 
-  # 下载整个文件夹
-  quarkpan download folder "/L2-2/L23-1/"
-
-  # 批量下载文件（使用文件ID）
-  quarkpan download files file_id1 file_id2 file_id3
+  # 使用 aria2c 多连接下载（推荐大文件，需先安装 aria2）
+  quarkpan download file "/L2-2/L23-1/民间秘术绝招大观.pdf" --aria2 -x 16
 
 [bold]功能特点:[/bold]
   • ✅ 支持文件路径和文件ID
@@ -247,6 +254,8 @@ def show_download_info():
   • ✅ 保持文件夹目录结构
   • ✅ 实时进度显示
   • ✅ 错误处理和重试机制
+  • ✅ 大文件秒过 23018 限制（自动切换客户端 UA）
+  • ✅ 可选 aria2c 多连接下载
 
 [bold yellow]注意事项:[/bold yellow]
   • 需要先登录夸克网盘账号
