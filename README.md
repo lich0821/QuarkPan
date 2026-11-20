@@ -748,6 +748,18 @@ pip install -r requirements.txt pytest pytest-asyncio
 3. 更新相关文档和示例代码
 4. 遵循 MIT 开源协议
 
+## 🤖 AI 使用声明
+
+本项目的部分改动在 AI 辅助下完成，使用的模型为 **DeepSeek V4.1 Flash**。
+
+AI 参与的改动范围：
+
+- 大文件下载 `code=23018` 的绕过与 aria2 集成
+- Firefox 浏览器 Cookie 读取
+- 交互模式的方向键、Tab 补全与目录缓存
+
+所有 AI 生成的代码均经过人工审阅，并在本地通过实测验证（详见各 PR 描述）。
+
 ## 📄 许可协议
 
 本项目采用 [MIT License](LICENSE) 开源协议。
