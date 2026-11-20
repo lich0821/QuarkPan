@@ -90,7 +90,7 @@ class ShellCompleter(Completer):
 
     def get_completions(self, document: Document, complete_event):
         before = document.text_before_cursor
-        word = document.get_word_before_cursor()  # 按空白切分的当前词（保留引号原样）
+        word = document.get_word_before_cursor(WORD=True)  # 只按空白切分，保留 / 与 .. 前缀
         stripped = before.strip()
 
         # 还在输入命令名
