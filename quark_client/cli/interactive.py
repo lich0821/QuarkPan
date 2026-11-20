@@ -126,24 +126,43 @@ class ShellCompleter(Completer):
         folder_only = cmd in _FOLDER_ONLY_COMMANDS or (cmd == 'move' and arg_index >= 2)
         prefix = self._unquote(word)
 
-        if cmd == 'cd' and '..'.startswith(prefix):
-            yield Completion('..', start_position=-len(word), display_meta='上级目录')
+        # 把前缀拆成「目录部分 + 名字部分」，支持 ../ 、/ 、子目录/
+        if '/' in prefix:
+            dir_part, name_prefix = prefix.rsplit('/', 1)
+            dir_part += '/'
+        else:
+            dir_part, name_prefix = '', prefix
 
-        # 首次 Tab 或刚切目录时缓存可能是空的：触发（并短暂等待）后台加载
-        if not self.shell.entries_ready():
-            self.shell.prefetch_entries(wait=2.0)
+        if dir_part:
+            base_id = self.shell.resolve_completion_dir(dir_part)
+            if base_id is None:
+                return
+        else:
+            base_id = self.shell.current_folder_id
 
-        for entry in self.shell.get_dir_entries():
+        # 未缓存时后台加载，首次 Tab 最多等 2 秒换正确结果
+        entries = self.shell.load_entries(base_id, wait=2.0)
+
+        # 根目录没有上级，不提供 ..
+        if cmd == 'cd' and base_id != '0' and '..'.startswith(name_prefix):
+            yield Completion(
+                dir_part + '..',
+                start_position=-len(word),
+                display='..',
+                display_meta='上级目录',
+            )
+
+        for entry in entries:
             name = entry.get('file_name') or ''
             if not name:
                 continue
             is_dir = entry.get('file_type') == 0
             if folder_only and not is_dir:
                 continue
-            if not name.lower().startswith(prefix.lower()):
+            if not name.lower().startswith(name_prefix.lower()):
                 continue
             yield Completion(
-                shlex.quote(name),
+                dir_part + shlex.quote(name),
                 start_position=-len(word),
                 display=name,
                 display_meta='文件夹' if is_dir else '文件',
@@ -169,11 +188,11 @@ class InteractiveShell:
         # 目录栈：存储 (folder_id, folder_name) 的路径
         self.directory_stack = [("0", "根目录")]
 
-        # 补全缓存与后台加载状态
-        self._dir_entries: List[dict] = []
-        self._entries_for: Optional[str] = None      # 已加载完成（含失败）的目录 id
-        self._entries_lock = threading.Lock()
-        self._prefetch_thread: Optional[threading.Thread] = None
+        # 补全缓存与后台加载状态（按 folder_id 缓存，支持 ../ 、/ 、子目录/ 前缀）
+        self._dir_cache: Dict[str, List[dict]] = {}
+        self._load_failed: set = set()                  # 已尝试且失败的目录 id
+        self._inflight: Dict[str, threading.Thread] = {}
+        self._cache_lock = threading.Lock()
         self._prefetch_error: Optional[str] = None
 
         # 命令映射
@@ -219,71 +238,110 @@ class InteractiveShell:
     # 补全缓存的后台加载
     # ------------------------------------------------------------------
     def entries_ready(self) -> bool:
-        """当前目录的补全缓存是否已加载（成功、空目录或失败都算已加载过）"""
-        return self._entries_for == self.current_folder_id
+        """当前目录是否已尝试加载过（成功、空目录或失败都算）"""
+        with self._cache_lock:
+            folder_id = self.current_folder_id
+            return folder_id in self._dir_cache or folder_id in self._load_failed
 
-    def get_dir_entries(self) -> List[dict]:
-        """返回当前目录的条目（缓存属于其他目录时返回空）"""
-        if not self.entries_ready():
-            return []
-        with self._entries_lock:
-            return list(self._dir_entries)
+    def load_entries(self, folder_id: str, wait: float = 0.0) -> List[dict]:
+        """取指定目录的条目；未缓存时后台加载，wait>0 则最多等这么久"""
+        thread = None
+        with self._cache_lock:
+            if folder_id in self._dir_cache:
+                return list(self._dir_cache[folder_id])
+            if folder_id in self._load_failed:
+                return []
+            thread = self._inflight.get(folder_id)
+            if thread is None and self.client is not None:
+                thread = threading.Thread(
+                    target=self._fetch_entries, args=(folder_id,), daemon=True
+                )
+                self._inflight[folder_id] = thread
+                thread.start()
+        if thread is not None and wait:
+            thread.join(wait)
+        with self._cache_lock:
+            return list(self._dir_cache.get(folder_id, []))
+
+    def _fetch_entries(self, folder_id: str) -> None:
+        """后台线程：拉指定目录的列表并写入缓存"""
+        entries: Optional[List[dict]] = None
+        try:
+            files = self.client.list_files(folder_id, size=50)  # type: ignore[union-attr]
+            entries = list(files.get('data', {}).get('list', []) or [])
+        except Exception as e:
+            self._prefetch_error = str(e)
+        with self._cache_lock:
+            if entries is None:
+                self._load_failed.add(folder_id)
+            else:
+                self._dir_cache[folder_id] = entries
+                self._load_failed.discard(folder_id)
+            self._inflight.pop(folder_id, None)
+        self._invalidate_prompt()
 
     def prefetch_entries(self, wait: float = 0.0) -> None:
-        """后台拉取当前目录列表，供 Tab 补全使用
+        """后台预加载当前目录，供 Tab 补全使用
 
         Args:
             wait: 最多等待多少秒（首次按 Tab 时用短暂等待换取正确结果）
         """
-        folder_id = self.current_folder_id
-        if self._entries_for == folder_id:
-            return
-
-        thread = self._prefetch_thread
-        if thread is not None and thread.is_alive():
-            if wait:
-                thread.join(wait)
-            return
-
-        if self.client is None:
-            return
-
-        self._prefetch_error = None
-        thread = threading.Thread(
-            target=self._prefetch_worker, args=(folder_id,), daemon=True
-        )
-        self._prefetch_thread = thread
-        thread.start()
-        if wait:
-            thread.join(wait)
-
-    def _prefetch_worker(self, folder_id: str) -> None:
-        """后台线程：拉目录列表并填充缓存"""
-        try:
-            files = self.client.list_files(folder_id, size=50)  # type: ignore[union-attr]
-            entries = files.get('data', {}).get('list', []) or []
-            with self._entries_lock:
-                self._dir_entries = list(entries)
-                self._entries_for = folder_id
-        except Exception as e:
-            with self._entries_lock:
-                self._dir_entries = []
-                self._entries_for = folder_id
-                self._prefetch_error = str(e)
-        finally:
-            self._invalidate_prompt()
-            # 加载期间用户切了目录：立即为新目录重新加载
-            if self.current_folder_id != folder_id:
-                self._prefetch_thread = None
-                self.prefetch_entries()
+        self.load_entries(self.current_folder_id, wait=wait)
 
     def _reset_entries(self) -> None:
-        """切换目录后作废补全缓存，并立即在后台重新加载"""
-        with self._entries_lock:
-            self._dir_entries = []
-            self._entries_for = None
-            self._prefetch_error = None
+        """切换目录后确保新目录已加载（已缓存过的目录直接命中）"""
         self.prefetch_entries()
+
+    def _remember_entries(self, folder_id: str, entries: List[dict]) -> None:
+        """用命令拿到的最新结果刷新缓存"""
+        with self._cache_lock:
+            self._dir_cache[folder_id] = list(entries)
+            self._load_failed.discard(folder_id)
+
+    def resolve_completion_dir(self, dir_part: str) -> Optional[str]:
+        """把补全前缀里的目录部分解析成 folder_id
+
+        支持 ``''``、``.``、``/``、``..``、``../..``、``子目录/``、``/子目录/``；
+        无法解析时返回 None（此时不给候选）。
+        """
+        if dir_part in ('', '.'):
+            return self.current_folder_id
+
+        absolute = dir_part.startswith('/')
+        parts = [p for p in dir_part.split('/') if p not in ('', '.')]
+
+        if absolute:
+            base_id = '0'
+        else:
+            base_id = self.current_folder_id
+            stack = list(self.directory_stack)
+            while parts and parts[0] == '..':
+                parts.pop(0)
+                if len(stack) > 1:
+                    stack.pop()
+                    base_id = stack[-1][0]
+                else:
+                    base_id = '0'
+
+        for name in parts:
+            if name == '..':
+                return None
+            entry = self._find_subfolder(base_id, name)
+            if entry is None:
+                return None
+            fid = entry.get('fid') or entry.get('file_id')
+            if not fid:
+                return None
+            base_id = str(fid)
+
+        return base_id
+
+    def _find_subfolder(self, folder_id: str, name: str) -> Optional[dict]:
+        """在指定目录里按名字找子文件夹"""
+        for entry in self.load_entries(folder_id, wait=1.0):
+            if entry.get('file_type') == 0 and entry.get('file_name') == name:
+                return entry
+        return None
 
     @staticmethod
     def _invalidate_prompt() -> None:
@@ -296,13 +354,22 @@ class InteractiveShell:
             pass
 
     def _bottom_toolbar(self):
-        """底部状态栏：加载中提示 / 当前路径与条目数"""
-        if not self.entries_ready():
+        """底部状态栏：加载中 / 加载失败 / 当前路径与条目数"""
+        folder_id = self.current_folder_id
+        with self._cache_lock:
+            failed = folder_id in self._load_failed
+            loaded = folder_id in self._dir_cache
+            count = len(self._dir_cache.get(folder_id, []))
+
+        if failed:
+            return HTML(
+                ' <style bg="ansiblack" fg="ansired"> 目录加载失败，执行 ls 可重试 </style> '
+            )
+        if not loaded:
             return HTML(
                 ' <style bg="ansiblack" fg="ansiyellow"> ⏳ 正在加载目录… </style> '
             )
         path = html.escape(self._get_current_path())
-        count = len(self._dir_entries)
         hint = 'Tab 补全 · Ctrl-R 搜索历史'
         return HTML(
             f' <style bg="ansiblack" fg="ansicyan">{path}</style>'
@@ -497,11 +564,8 @@ class InteractiveShell:
             files = self.client.list_files(target_folder_id, size=50)  # type: ignore[attr-defined]
             file_list = files.get('data', {}).get('list', [])
 
-            # 仅当列出的是当前目录时，才更新补全缓存
-            if target_folder_id == self.current_folder_id:
-                with self._entries_lock:
-                    self._dir_entries = list(file_list)
-                    self._entries_for = target_folder_id
+            # 刷新补全缓存（不论是否为当前目录，都可能被 Tab 前缀用到）
+            self._remember_entries(target_folder_id, file_list)
 
             if not file_list:
                 print_info("目录为空")
@@ -533,9 +597,7 @@ class InteractiveShell:
             file_list = files.get('data', {}).get('list', [])
 
             # 更新补全缓存
-            with self._entries_lock:
-                self._dir_entries = list(file_list)
-                self._entries_for = self.current_folder_id
+            self._remember_entries(self.current_folder_id, file_list)
 
             if not file_list:
                 print_info("目录为空")
